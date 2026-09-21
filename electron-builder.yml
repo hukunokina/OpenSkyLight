@@ -10,7 +10,7 @@ asarUnpack:
   - node_modules/ffmpeg-static/**
 publish:
   provider: github
-  owner: lowerygt
+  owner: hukunokina
   repo: OpenSkyLight
   releaseType: release
 win:

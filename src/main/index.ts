@@ -117,7 +117,7 @@ if (!gotLock) {
     createMainWindow()
     syncManager.start()
     kiosk.start()
-    updater.start()
+    // updater.start() — auto-update from upstream GitHub Releases disabled for this self-built kiosk
     companion.applySettings()
 
     app.on('activate', () => {
