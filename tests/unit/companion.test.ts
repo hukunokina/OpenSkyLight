@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type os from 'node:os'
 import { createCompanionTokens } from '../../src/main/companion/companionTokens'
-import { pickLanAddresses } from '../../src/main/companion/lanAddress'
+import { pickTailscaleAddresses } from '../../src/main/companion/tailscaleAddress'
 import { createCompanionServer, type CompanionServer } from '../../src/main/companion/companionServer'
 import type { SettingsService } from '../../src/main/services/settingsService'
 import type { IpcResult } from '../../src/shared/ipc/contract'
@@ -59,29 +59,29 @@ describe('companionTokens', () => {
   })
 })
 
-describe('pickLanAddresses', () => {
+describe('pickTailscaleAddresses', () => {
   const iface = (
     address: string,
     internal = false,
     family: 'IPv4' | 'IPv6' = 'IPv4'
   ): os.NetworkInterfaceInfo => ({ address, internal, family, netmask: '', mac: '', cidr: null }) as os.NetworkInterfaceInfo
 
-  it('prefers real-NIC private addresses over virtual adapters and skips junk', () => {
-    const result = pickLanAddresses({
+  it('returns only 100.64/10 addresses, the Tailscale adapter first, and skips the LAN', () => {
+    const result = pickTailscaleAddresses({
       'Loopback Pseudo-Interface 1': [iface('127.0.0.1', true)],
-      'vEthernet (WSL)': [iface('172.27.0.1')],
       'Wi-Fi': [iface('192.168.0.42'), iface('fe80::1', false, 'IPv6')],
-      Ethernet: [iface('169.254.10.10')]
+      'vEthernet (WSL)': [iface('100.100.5.5')], // in range but not the Tailscale adapter
+      Tailscale: [iface('100.81.218.90')],
+      Ethernet: [iface('100.200.1.1')] // 100.x but outside 100.64/10
     })
-    expect(result[0]).toBe('192.168.0.42')
-    expect(result).toContain('172.27.0.1') // shown as an alternate
-    expect(result).not.toContain('127.0.0.1')
-    expect(result).not.toContain('169.254.10.10')
-    expect(result).not.toContain('fe80::1')
+    expect(result).toEqual(['100.81.218.90', '100.100.5.5'])
+    expect(result).not.toContain('192.168.0.42')
+    expect(result).not.toContain('100.200.1.1')
   })
 
-  it('returns empty for no usable interfaces', () => {
-    expect(pickLanAddresses({})).toEqual([])
+  it('returns empty while Tailscale is down', () => {
+    expect(pickTailscaleAddresses({ 'Wi-Fi': [iface('192.168.0.42')] })).toEqual([])
+    expect(pickTailscaleAddresses({})).toEqual([])
   })
 })
 
@@ -108,7 +108,8 @@ describe('companionServer', () => {
       tokens,
       dispatch: dispatchImpl ?? (async () => ({ ok: true, data: 'dispatched' })),
       version: '0.0.0-test',
-      staticRoot
+      staticRoot,
+      pickAddresses: () => ['127.0.0.1'] // real builds bind the Tailscale address; tests serve on loopback
     })
     server.applySettings()
     // wait for listen

@@ -5,9 +5,10 @@ import type { IpcChannel, IpcResult } from '@shared/ipc/contract'
 import { COMPANION_CHANNELS } from '@shared/ipc/companionChannels'
 import type { SettingsService } from '../services/settingsService'
 import type { CompanionTokens } from './companionTokens'
-import { pickLanAddresses } from './lanAddress'
+import { pickTailscaleAddresses } from './tailscaleAddress'
 
 const MAX_BODY_BYTES = 64 * 1024
+const RETRY_MS = 15_000 // the kiosk boots before Tailscale is up; poll until the adapter appears
 const AUTH_FAIL_LIMIT = 30 // failures per IP per minute → 429
 const AUTH_FAIL_WINDOW_MS = 60_000
 
@@ -31,17 +32,23 @@ export interface CompanionServerDeps {
   version: string
   /** Directory holding the built companion web app (out/companion). */
   staticRoot: string
+  /** Addresses to bind, best first; injectable so tests can serve on loopback. */
+  pickAddresses?: () => string[]
 }
 
 /**
- * LAN-facing HTTP server for the companion web app: serves the static mobile
- * UI and exposes an allowlisted slice of the IPC contract as POST /api/rpc/*.
+ * Tailnet-facing HTTP server for the companion web app: bound to the kiosk's
+ * Tailscale address only (never the LAN), serves the static mobile UI and
+ * exposes an allowlisted slice of the IPC contract as POST /api/rpc/*.
  * Auth is a bearer token minted from the (PIN-gated) kiosk settings QR.
  */
 export function createCompanionServer(deps: CompanionServerDeps) {
   let server: Server | null = null
+  let boundHost: string | null = null
   let boundPort: number | null = null
   let lastError: string | null = null
+  let retryTimer: NodeJS.Timeout | null = null
+  const pickAddresses = deps.pickAddresses ?? pickTailscaleAddresses
   const authFails = new Map<string, { count: number; windowStart: number }>()
 
   function rateLimited(ip: string): boolean {
@@ -189,9 +196,23 @@ export function createCompanionServer(deps: CompanionServerDeps) {
     void serveStatic(res, url)
   }
 
+  function scheduleRetry(): void {
+    if (retryTimer) clearTimeout(retryTimer)
+    retryTimer = setTimeout(() => {
+      retryTimer = null
+      applySettings()
+    }, RETRY_MS)
+  }
+
   function start(port: number): void {
     if (server) return
     lastError = null
+    const [host] = pickAddresses()
+    if (!host) {
+      lastError = 'Tailscale is not connected — the companion app is only served over the tailnet'
+      scheduleRetry()
+      return
+    }
     const srv = createServer(onRequest)
     srv.on('error', (err: NodeJS.ErrnoException) => {
       lastError =
@@ -200,20 +221,26 @@ export function createCompanionServer(deps: CompanionServerDeps) {
       srv.close()
       if (server === srv) {
         server = null
+        boundHost = null
         boundPort = null
       }
+      scheduleRetry()
     })
-    srv.listen(port, '0.0.0.0', () => {
+    srv.listen(port, host, () => {
       const addr = srv.address()
+      boundHost = host
       boundPort = typeof addr === 'object' && addr ? addr.port : port
-      console.log(`[companion] serving on 0.0.0.0:${boundPort}`)
+      console.log(`[companion] serving on ${host}:${boundPort}`)
     })
     server = srv
   }
 
   function stop(): void {
+    if (retryTimer) clearTimeout(retryTimer)
+    retryTimer = null
     server?.close()
     server = null
+    boundHost = null
     boundPort = null
   }
 
@@ -231,11 +258,11 @@ export function createCompanionServer(deps: CompanionServerDeps) {
 
   function getStatus(): { running: boolean; port: number; urls: string[]; pairedCount: number; lastError: string | null } {
     const { port } = deps.settings.getAll().companion
-    const running = server !== null && boundPort !== null
+    const running = server !== null && boundHost !== null && boundPort !== null
     return {
       running,
       port,
-      urls: running ? pickLanAddresses().map((ip) => `http://${ip}:${boundPort}/`) : [],
+      urls: running ? [`http://${boundHost}:${boundPort}/`] : [],
       pairedCount: deps.tokens.count(),
       lastError
     }
@@ -245,8 +272,8 @@ export function createCompanionServer(deps: CompanionServerDeps) {
   function issueToken(): { url: string } {
     const { port } = deps.settings.getAll().companion
     const token = deps.tokens.issue()
-    const [best] = pickLanAddresses()
-    return { url: `http://${best ?? 'localhost'}:${boundPort ?? port}/#t=${token}` }
+    const host = boundHost ?? pickAddresses()[0]
+    return { url: `http://${host ?? 'localhost'}:${boundPort ?? port}/#t=${token}` }
   }
 
   function unpairAll(): void {
